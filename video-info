@@ -1,0 +1,39 @@
+#!/usr/bin/python
+# Spew all the mplayer ID_ tags for the first 10 frames. Only the last of
+# repeated tags are reported.
+#
+# Copyright 2006-2011, Kees Cook <kees@outflux.net>
+# License: GPLv3
+import sys, subprocess
+
+#mplayer -identify -frames 10 -ao null -vo null "$@" 2>/dev/null | grep ^ID_
+
+# Remove the "-frames" argument
+args = []
+arg = 0
+while arg+1 < len(sys.argv):
+    arg += 1
+    if sys.argv[arg] == '-frames':
+        arg += 1
+        continue
+    if sys.argv[arg].startswith('-frames='):
+        continue
+    args.append(sys.argv[arg])
+
+p = subprocess.Popen(['mplayer','-identify',
+                                #'-demuxer','lavf',
+                                '-frames','10','-ao','null',
+                                '-vo','null'] + args,
+                     stdout=subprocess.PIPE, stderr=open('/dev/null','w'))
+report = dict()
+fields = list()
+for line in p.stdout:
+    line = line.rstrip()
+    if line.startswith('ID_'):
+        field, value = line.split('=',1)
+        if not field in fields:
+            fields.append(field)
+            report[field] = value
+for field in fields:
+    print "%s=%s" % (field, report[field])
+sys.exit(0)

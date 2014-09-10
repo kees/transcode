@@ -1,0 +1,152 @@
+#!/bin/bash
+# Copyright (C) 2009-2013, Kees Cook <kees@outflux.net>
+# License: GPLv3
+#
+# For 1080i might need hack for http://bugzilla.mplayerhq.hu/show_bug.cgi?id=798
+# http://forum.doom9.org/archive/index.php/t-124528.html
+#
+# Use differently compiled mencoder via $MENCODER environment variable.
+# Use additional mencoder options via $MENCODER_OPTS environment variable.
+set -e
+
+res="$1"
+shift || true
+
+out="$1"
+shift || true
+
+if [ -z "$out" ] || [ -z "$1" ]; then
+    echo "Usage: $0 res DEST SOURCE..." >&2
+    echo "Examples" >&2
+    echo "  $0 output.avi dvd://3 -dvd-device TITLE_S1_D4 -aid 128" >&2
+    exit 1
+fi
+
+if [ -f "$out" ]; then
+    echo "Not overwriting existing file '$out'" >&2
+    exit 1
+fi
+
+mplayer_info=$($(dirname $0)/video-info "$@")
+
+# Attempt to detect busted 1080 demuxer.
+video_height=$(echo "$mplayer_info" | grep ^ID_VIDEO_HEIGHT | tail -n1 | cut -d= -f2- | cut -d. -f1)
+demuxer=""
+if [ "$video_height" -eq 1088 ]; then
+    demuxer="-demuxer lavf"
+    mplayer_info=$($(dirname $0)/video-info $demuxer "$@")
+fi
+
+# Examine info (with potentially adjusted demuxer) for actionable information.
+video_height=$(echo "$mplayer_info" | grep ^ID_VIDEO_HEIGHT | tail -n1 | cut -d= -f2- | cut -d. -f1)
+video_fps=$(echo "$mplayer_info" | grep ^ID_VIDEO_FPS | tail -n1 | cut -d= -f2- | cut -d. -f1)
+vcodec=$(echo "$mplayer_info" | grep ^ID_VIDEO_CODEC | tail -n1 | cut -d= -f2-)
+audio_format=$(echo "$mplayer_info" | grep ^ID_AUDIO_FORMAT | tail -n1 | cut -d= -f2- | cut -d. -f1)
+
+# Detect uncopyable audio formats and force encoding.
+oac=copy
+if [ "$audio_format" = "twos" ] || [ "$audio_format" = "MP4A" ]; then
+    oac=mp3lame
+fi
+
+# By default, disable subtitle handling.
+subs="-nosub"
+
+# Is there an existing EDL? Use it during encode.
+edl=""
+if [ -r "$1".edl ]; then
+    edl="-edl $1.edl -hr-edl-seek -quiet"
+fi
+
+remux=""
+deint=""
+bitrate=""
+
+case $res in
+    480p)
+        bitrate=1750
+        ;;
+
+    480|480i)
+        bitrate=1750
+
+        if [ "$video_fps" = "29.970" ]; then
+            deint="-vf filmdint=io=29970:23976/fast=0,softskip -fps 30000/1001 -ofps 24000/1001"
+        fi
+        ;;
+
+    720)
+        # At 30fps, lower bit rate
+        bitrate=2400
+
+        if [ $video_fps -gt 30 ]; then
+            # Broadcast 60/1001 fps
+
+            # Works, but needs playback with -mc 1
+            bitrate=4800
+            deint="-mc 10 -noskip"
+        fi
+        ;;
+
+    1080)
+        # Resize to 720p!
+        bitrate=2400
+        scale=",scale=-2:720"
+
+        # Resize to 480p ...
+        #bitrate=800
+        #scale=",scale=-2:480"
+
+        # Leave at 1080...
+        #bitrate=4000
+        #scale=""
+
+        if [ "$video_fps" = "29.970" ]; then
+            # Default 29.97fps to 23.976fps deinterlacing
+            deint="-vf filmdint=io=29970:23976/fast=0,softskip${scale} -fps 30000/1001 -ofps 24000/1001"
+            # Hack for cropping!
+            #deint="-vf filmdint=crop=1424:808:248:128 -fps 30000/1001 -ofps 24000/1001"
+        fi
+
+        # Try different deinterlacing?
+        #deint="-vf yadif=1,framestep=2,filmdint=dint_thres=256,scale=-2:720 -fps 30000/1001 -ofps 24000/1001"
+
+        if [ $video_fps -gt 30 ]; then
+            # In the 59.94 fps case, tricking filmdint seems to help, but
+            # then the A/V is wildly out of sync, so it needs a remuxing
+            # as the final step, but that doesn't really work either.
+            deint="-vf filmdint=io=29970:23976/fast=0,softskip${scale} -fps 60000/1001 -ofps 24000/1001"
+            remux=1
+        fi
+
+        ;;
+
+    crazy1080p)
+        bitrate=4800
+
+        if [ $video_fps -gt 30 ]; then
+            # Works, untested, but I suspect it needs playback with -mc 1
+            bitrate=6400
+            deint="-mc 10 -noskip"
+        fi
+        ;;
+    *)
+        echo "Unknown video height $video_height" >&2
+        exit 1
+        ;;
+esac
+
+log=$(mktemp -t divxlog-XXXXXX)
+opts="$edl $demuxer $subs $deint -oac $oac -passlogfile $log -ovc lavc -lavcopts vcodec=mpeg4:vhq:v4mv:vqmin=2:autoaspect=1:vbitrate=$bitrate"
+opts_pass1="$opts:vpass=1"
+opts_pass2="$opts:vpass=2"
+
+set -x
+${MENCODER:-mencoder} $MENCODER_OPTS $opts_pass1 "$@" -o /dev/null
+${MENCODER:-mencoder} $MENCODER_OPTS $opts_pass2 "$@" -o "$out"
+
+if [ -n "$remux" ]; then
+    mv "$out" "$out".avi
+    ffmpeg -i "$out".avi -i "$out".avi -vcodec copy -acodec copy -map 0.0 -map 1.1 "$out"
+fi
+rm -f $log
