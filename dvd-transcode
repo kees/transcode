@@ -1,0 +1,135 @@
+#!/usr/bin/python
+# Copyright (C) 2009-2010, Kees Cook <kees@outflux.net>
+# License: GPLv3
+#
+# disc=1; while :; do dvd-transcode -M 3600 /dev/scd0 Babylon5-s3-d${disc}; disc=$(( $disc + 1 )); eject; echo "Disk $disc please ..."; while [ ! -d /media/cdrom0/VIDEO_TS ]; do sleep 1; done; done
+#
+# s=3; disc=4; while :; do prefix=Title-s${s}-d${disc}; mkdir $prefix; vobcopy -m -o $prefix/; (dvdfs2iso $prefix.iso $prefix/* >/dev/null 2>&1 && rm -rf $prefix) & disc=$(( $disc + 1 )); eject & echo "Disc $s $disc please ..."; while [ ! -d /media/cdrom0/VIDEO_TS ]; do sleep 1; done; done
+import subprocess, sys
+import pprint
+import optparse
+import tempfile
+
+parser = optparse.OptionParser(usage='%prog [options] ISO [PREFIX]')
+parser.add_option("-n","--dry-run", help="Do not actually run transcoder", action='store_true')
+parser.add_option("-v","--verbose", help="Report commands and encoder output", action='store_true')
+parser.add_option("-t","--transcoder", metavar="PROGRAM", help="Specify a transcoder to use (default: automatic)", action='store', default=None)
+parser.add_option("-m","--minimum", metavar="SECONDS", help="Lower limit on number of seconds a title must be (default: 5*60)", action='store', default=5*60, type='int')
+parser.add_option("-M","--maximum", metavar="SECONDS", help="Upper limit on number of seconds a title can be (default: None)", action='store', default=None, type='int')
+parser.add_option("-i","--input-args", metavar="ARGS", help="Additional arguments to list for transoder input", action='store')
+parser.add_option("--skip", metavar="TITLE[,TITLE...]", help="Skip specific title", action='store')
+(opt, args) = parser.parse_args()
+
+if len(args)<1:
+    print parser.format_help(),
+    sys.exit(1)
+src = args[0]
+if len(args)>1:
+    prefix = args[1]
+else:
+    prefix = src
+    while prefix.endswith('/'):
+        prefix = prefix[:-1]
+    prefix = prefix.split('/').pop().lower().replace(' ', '_').capitalize()
+
+# expand skip list
+if opt.skip is None:
+    opt.skip = []
+else:
+    opt.skip = [int(x) for x in opt.skip.split(',')]
+
+def cmd(args):
+    if opt.verbose:
+        print '\t' + " ".join(args)
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    if p.returncode != 0:
+        raise OSError, stderr
+    return stdout, stderr
+
+print 'Reading %s ...' % (src)
+stdout, stderr = cmd(["lsdvd", "-a", "-Oy", src])
+stdout = stdout.replace('lsdvd =','')
+stdout = "\n".join([x for x in stdout.splitlines() if not "device' : '" in x])
+lsdvd = eval(stdout.replace('lsdvd =',''))
+#pprint.pprint(lsdvd)
+
+min = 5*60
+count = 1
+for title in lsdvd['track']:
+    titlenum = int(title['ix'])
+    length_report = '(%d:%02d)' % (title['length']/60, title['length'] % 60)
+    report = 'title %d %s' % (titlenum, length_report)
+
+    # Skip title in the explicit skip-list
+    if titlenum in opt.skip:
+        print 'Explicitly skipping %s %s' % (src, report)
+        continue
+    # Skip titles that are too long
+    if not opt.maximum is None and title['length'] > opt.maximum:
+        print 'Too long, skipping %s %s' % (src, report)
+        continue
+    # Skip titles that are too short
+    if title['length'] < opt.minimum:
+        print 'Too short, skipping %s %s' % (src, report)
+        continue
+    if opt.verbose:
+        print 'Want %s ...' % (report)
+
+    inputs = ['-dvd-device', src, 'dvd://%d' % (titlenum)]
+    output = '%s-%02d.avi' % (prefix, count)
+    count += 1
+
+    best = None
+    channels = 0
+    for audio in title['audio']:
+        if audio['langcode'] == 'en':
+            # lsdvd seems to not be accurate about audio channels all the time
+            # so we need to launch mplayer to verify.  Look 10 frames deep for
+            # a matching audio codec.
+            stdout, stderr = cmd(["mplayer","-dvd-device",src,"dvd://%d"%(titlenum),"-aid",audio['streamid'],'-frames','10','-vo','null','-ao','null','-identify'])
+            valid = False
+            for line in stdout.splitlines():
+                if line.startswith('ID_AUDIO_CODEC='):
+                    valid = True
+                    break
+            if not valid:
+                continue
+
+            if best is None or audio['channels'] > channels:
+                best = audio['streamid']
+                channels = audio['channels']
+    if not best is None:
+        inputs += ['-aid',best]
+    if opt.input_args:
+        inputs += opt.input_args.split(' ')
+
+    # Attempt to auto-detect filmdint needs
+    if opt.transcoder is None:
+        # Watch for roughly 2 minutes of video for an NTSC detection
+        stdout, stderr = cmd(["mplayer","-dvd-device",src,"dvd://%d"%(titlenum),"-aid",audio['streamid'],'-frames','3600','-vo','null','-nosound','-benchmark'])
+        transcoder = ['video-transcode','480p']
+        for line in stdout.splitlines():
+            if line.startswith('demux_mpg: 24000/1001fps progressive NTSC content detected, switching framerate.'):
+                transcoder = ['video-transcode', '480i']
+                break
+    else:
+        transcoder = [opt.transcoder]
+
+    if opt.verbose:
+        print "\t%s %s %s" % (transcoder, output, inputs)
+    else:
+        print "Encoding %s %s with %s ..." % \
+            (src, report, transcoder)
+    if not opt.dry_run:
+        if opt.verbose:
+            stdout = None
+        else:
+            stdout = tempfile.NamedTemporaryFile(prefix='mencoder-log-')
+        stderr = subprocess.STDOUT
+        retcode = subprocess.call(transcoder+[output]+inputs,stdout=stdout,stderr=stderr)
+        if retcode != 0:
+            if not stdout is None:
+                stdout.flush()
+                subprocess.call(['cat',stdout.name])
+            raise OSError, "transcoder failed"
